@@ -5,7 +5,7 @@ ee.Initialize()
 
 # Load ERA5 daily data
 era5 = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR").select([
-    'temperature_2m_mean'  # Correct band for 2m temperature
+    'temperature_2m'  # Correct band for 2m temperature
 ])
 
 # Define the time range (data available from 2001 onwards)

@@ -1,0 +1,64 @@
+import ee
+
+# Initialize the Earth Engine API
+ee.Initialize()
+
+# Load ERA5 daily data
+era5 = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR").select([
+    'temperature_2m_mean'  # Correct band for 2m temperature
+])
+
+# Define the time range (data available from 2001 onwards)
+start_date = '2001-01-01'
+end_date = '2023-12-31'
+
+# Filter the collection by date
+era5_filtered = era5.filterDate(start_date, end_date)
+
+# Define the region of interest (ROI)
+xmin, ymin, xmax, ymax = 60, 23, 80, 38  # Replace with your bounding box
+roi = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
+
+# Extract the coordinates of the ROI in the correct format
+region_coords = roi.bounds().getInfo()['coordinates']
+
+# Function to calculate monthly mean for 2m temperature
+def calculate_monthly_mean():
+    monthly_mean = []
+    for month_offset in range(0, 600):  # 600 months from January 1974 to December 2023
+        start = ee.Date(start_date).advance(month_offset, 'month')
+        end = start.advance(1, 'month')
+        monthly = (era5_filtered
+                   .filterDate(start, end)
+                   .mean()
+                   .set('month', start.format('YYYY-MM'))
+                   .set('system:index', start.format('YYYY-MM'))  # Set index for identification
+                   .clip(roi))
+        
+        # Export each month's data
+        img = ee.Image(monthly)
+        month_info = img.get('system:index').getInfo()  # Correctly get info from 'system:index'
+        month = month_info.split('-')[1]  # Access the month
+        year = month_info.split('-')[0]  # Access the year
+        task = ee.batch.Export.image.toDrive(
+            image=img,
+            description=f'temp_{year}_{month}',
+            folder='ERA5_Monthly_Temp',
+            scale=9000,  # Native resolution
+            region=region_coords,  # Correctly formatted region
+            maxPixels=1e13
+        )
+        task.start()
+        
+        monthly_mean.append(task)
+    
+    return monthly_mean
+
+# Calculate and download monthly means
+task_list = calculate_monthly_mean()
+
+# Print tasks to monitor their status
+for task in task_list:
+    # Extract task ID and description from the task object
+    task_id = task.id
+    print(f"Exporting: ERA5_Monthly_mean_temp_{task_id}")

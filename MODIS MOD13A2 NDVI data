@@ -1,0 +1,59 @@
+import ee
+
+# Initialize the Earth Engine API
+ee.Initialize()
+
+# Load MODIS MOD13A2 NDVI data
+modis = ee.ImageCollection('MODIS/061/MOD13A2').select('NDVI')
+
+# Define the time range
+start_date = '2001-01-01'
+end_date = '2023-12-31'
+
+# Define the region of interest (ROI)
+xmin, ymin, xmax, ymax = 60, 23, 80, 38  # Replace with your bounding box
+roi = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
+
+# Extract the coordinates of the ROI in the correct format
+region_coords = roi.bounds().getInfo()['coordinates']
+
+# Function to calculate monthly NDVI mean
+def calculate_monthly_ndvi():
+    monthly_ndvi = []
+    for month_offset in range(0, 600):  # 600 months from January 1974 to December 2023
+        start = ee.Date(start_date).advance(month_offset, 'month')
+        end = start.advance(1, 'month')
+        monthly = (modis
+                   .filterDate(start, end)
+                   .mean()  # Calculate mean NDVI for the month
+                   .set('month', start.format('YYYY-MM'))
+                   .set('system:index', start.format('YYYY-MM'))  # Set index for identification
+                   .clip(roi))
+        
+        # Export each month's data
+        img = ee.Image(monthly)
+        month_info = img.get('system:index').getInfo()  # Correctly get info from 'system:index'
+        month = month_info.split('-')[1]  # Access the month
+        year = month_info.split('-')[0]  # Access the year
+        task = ee.batch.Export.image.toDrive(
+            image=img,
+            description=f'ndvi_{year}_{month}',
+            folder='MODIS_Monthly_NDVI',
+            scale=1000,  # MOD13A2 resolution is 1km (1000m)
+            region=region_coords,
+            maxPixels=1e13
+        )
+        task.start()
+        
+        monthly_ndvi.append(task)
+    
+    return monthly_ndvi
+
+# Calculate and download monthly NDVI
+task_list = calculate_monthly_ndvi()
+
+# Print tasks to monitor their status
+for task in task_list:
+    # Extract task ID and description from the task object
+    task_id = task.id
+    print(f"Exporting: MODIS_Monthly_NDVI_{task_id}")

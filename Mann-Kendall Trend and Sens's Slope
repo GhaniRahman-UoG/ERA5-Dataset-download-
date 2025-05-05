@@ -1,0 +1,94 @@
+import os
+import numpy as np
+import rasterio
+from pymannkendall import original_test
+from scipy.stats import linregress
+
+# Directories for input and output
+data_dir = "E:/VHI South Asia/NDVI Mean"
+output_dir = "E:/VHI South Asia/NDVI Trend"
+
+# Load NDVI files
+file_list = sorted([os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".tif")])
+
+# Read NDVI data into a 3D array (time, rows, cols)
+stack = []
+meta = None
+for file in file_list:
+    with rasterio.open(file) as src:
+        if meta is None:
+            meta = src.meta
+        stack.append(src.read(1))  # Read the first band
+
+stack = np.array(stack)  # Convert to 3D array
+
+# Handle no-data values in the stack
+nodata_value = meta.get("nodata", -9999)
+stack[stack == nodata_value] = np.nan
+
+# Initialize output arrays
+rows, cols = stack.shape[1], stack.shape[2]
+mk_z = np.full((rows, cols), np.nan, dtype="float32")  # Mann-Kendall Z values
+sen_slope = np.full((rows, cols), np.nan, dtype="float32")  # Sen's slope
+trend_classification = np.full((rows, cols), -9999, dtype="int32")  # Trend classification with valid no-data value
+
+# Perform pixel-wise calculations
+for i in range(rows):
+    for j in range(cols):
+        pixel_data = stack[:, i, j]
+
+        # Remove NaN and negative NDVI values
+        valid_data = pixel_data[(~np.isnan(pixel_data)) & (pixel_data >= 0)]
+        if len(valid_data) < 2:  # Skip if fewer than 2 valid values
+            continue
+
+        # Classify areas based on NDVI thresholds
+        mean_ndvi = np.nanmean(valid_data)  # Compute mean NDVI for the pixel over time
+        if mean_ndvi < 0.1:
+            trend_classification[i, j] = 6  # Sparse Vegetation
+            continue
+        elif 0.1 <= mean_ndvi < 0.2:
+            trend_classification[i, j] = 7  # Low Vegetation
+        elif 0.2 <= mean_ndvi < 0.4:
+            trend_classification[i, j] = 8  # Agricultural Land
+        elif mean_ndvi >= 0.4:
+            trend_classification[i, j] = 9  # Healthy Vegetation
+
+        # Perform trend analysis for classified areas (low vegetation and above)
+        if mean_ndvi >= 0.1:  # Include low vegetation and above
+            # Mann-Kendall test
+            mk_result = original_test(valid_data)
+            mk_z[i, j] = mk_result.z
+
+            # Sen's slope (linear regression slope approximation)
+            x = np.arange(len(valid_data))
+            slope, _, _, _, _ = linregress(x, valid_data)
+            sen_slope[i, j] = slope
+
+            # Classify trends based on Z-values
+            if mk_result.z > 1.96:
+                trend_classification[i, j] = 1  # Significant Increase
+            elif 0 < mk_result.z <= 1.96:
+                trend_classification[i, j] = 2  # Non-Significant Increase
+            elif -1.96 <= mk_result.z < 0:
+                trend_classification[i, j] = 3  # Non-Significant Decrease
+            elif mk_result.z < -1.96:
+                trend_classification[i, j] = 4  # Significant Decrease
+
+# Save results as GeoTIFFs
+meta.update(dtype="float32", count=1, nodata=np.nan)
+
+# Save Mann-Kendall Z values
+with rasterio.open(os.path.join(output_dir, "mk_z.tif"), "w", **meta) as dst:
+    dst.write(mk_z, 1)
+
+# Save Sen's slope
+with rasterio.open(os.path.join(output_dir, "sen_slope.tif"), "w", **meta) as dst:
+    dst.write(sen_slope, 1)
+
+# Save trend classification
+meta.update(dtype="int32", nodata=-9999)  # Integer no-data value for classification
+with rasterio.open(os.path.join(output_dir, "trend_classification.tif"), "w", **meta) as dst:
+    dst.write(trend_classification, 1)
+
+print("Processing complete. Outputs saved!")

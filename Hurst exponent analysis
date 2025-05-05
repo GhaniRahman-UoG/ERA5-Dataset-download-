@@ -1,0 +1,88 @@
+import os
+import numpy as np
+import rasterio
+import glob
+import matplotlib.pyplot as plt
+
+def calculate_hurst_index(ndvi_files):
+    """
+    Calculate the Hurst index for a series of NDVI rasters.
+    :param ndvi_files: List of file paths for NDVI rasters.
+    :return: Numpy array of Hurst index values.
+    """
+    # Read all rasters into a single 3D array (time, rows, cols)
+    ndvi_stack = []
+    for file in ndvi_files:
+        with rasterio.open(file) as src:
+            ndvi_stack.append(src.read(1))  # Read the first band
+    
+    ndvi_stack = np.array(ndvi_stack)  # Shape: (time, rows, cols)
+    time_steps, rows, cols = ndvi_stack.shape
+    
+    # Initialize an array to store the Hurst index
+    hurst_index = np.full((rows, cols), np.nan)
+    
+    for row in range(rows):
+        for col in range(cols):
+            # Extract the time series for the pixel
+            ts = ndvi_stack[:, row, col]
+            # Skip if the time series contains NaNs or extreme values
+            if np.any(np.isnan(ts)) or np.any((ts < -1) | (ts > 1)):
+                continue
+            
+            # Calculate mean-centered cumulative deviation
+            mean_ts = np.mean(ts)
+            cumulative_deviation = np.cumsum(ts - mean_ts)
+            
+            # Calculate R (range) and S (standard deviation)
+            R = np.max(cumulative_deviation) - np.min(cumulative_deviation)
+            S = np.std(ts)
+            
+            # Avoid division by zero
+            if S == 0 or R == 0:
+                continue
+            
+            # Calculate R/S for varying time windows
+            RS_values = []
+            log_tau = []
+            for tau in range(2, len(ts) + 1):  # At least 2 data points
+                partial_ts = ts[:tau]
+                partial_mean = np.mean(partial_ts)
+                partial_deviation = np.cumsum(partial_ts - partial_mean)
+                R_tau = np.max(partial_deviation) - np.min(partial_deviation)
+                S_tau = np.std(partial_ts)
+                if S_tau > 0:
+                    RS_values.append(R_tau / S_tau)
+                    log_tau.append(np.log(tau))
+            
+            # Log-log regression to find the slope (Hurst index)
+            if len(RS_values) > 1:
+                log_RS = np.log(RS_values)
+                if len(log_tau) == len(log_RS):  # Ensure matching lengths
+                    slope, _ = np.polyfit(log_tau, log_RS, 1)
+                    hurst_index[row, col] = slope
+    
+    return hurst_index
+
+# Directory containing the NDVI raster files
+ndvi_dir = "E:/VHI South Asia/NDVI Mean"
+ndvi_files = sorted(glob.glob(os.path.join(ndvi_dir, "*.tif")))
+
+# Calculate Hurst index
+hurst_result = calculate_hurst_index(ndvi_files)
+
+# Save the Hurst index as a new raster file
+output_file = "E:/VHI South Asia/hurst_index.tif"
+with rasterio.open(ndvi_files[0]) as src:
+    profile = src.profile
+    profile.update(dtype=rasterio.float32, count=1, nodata=np.nan)
+    with rasterio.open(output_file, 'w', **profile) as dst:
+        dst.write(hurst_result.astype(np.float32), 1)
+
+print(f"Hurst index raster saved to {output_file}")
+
+# Visualize the Hurst index
+plt.imshow(hurst_result, cmap='viridis')
+plt.colorbar(label="Hurst Index")
+plt.title("Hurst Index Map")
+plt.show()

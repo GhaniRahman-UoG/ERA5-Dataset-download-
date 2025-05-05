@@ -1,0 +1,168 @@
+import os
+import rasterio
+import numpy as np
+from sklearn.linear_model import LinearRegression
+
+# Directories
+ndvi_dir = "E:/VHI South Asia/NDVI Mean"
+lst_dir = "E:/VHI South Asia/LST Mean"
+meantemp_dir = "E:/VHI South Asia/Annual Mean Temperature"
+precip_dir = "E:/VHI South Asia/Prec"
+pet_dir = "E:/VHI South Asia/PET"
+output_dir = "E:/Residuals"
+
+# Function to extract years from filenames
+def extract_years(directory, prefix):
+    files = os.listdir(directory)
+    years = []
+    for f in files:
+        if f.startswith(prefix) and f.endswith('.tif'):
+            try:
+                years.append(f.split('_')[1][:4])  # Extract the year
+            except IndexError:
+                print(f"File {f} does not match the expected pattern.")
+    print(f"Extracted years from {directory}: {years}")
+    return sorted(years)
+
+# Extract years for all datasets
+ndvi_years = extract_years(ndvi_dir, "NDVI")
+lst_years = extract_years(lst_dir, "LST")
+precip_years = extract_years(precip_dir, "Prec")
+pet_years = extract_years(pet_dir, "PET")
+
+# Find common years across datasets
+common_years = sorted(set(ndvi_years) & set(lst_years) & set(precip_years) & set(pet_years))
+print("Common Years:", common_years)
+
+# Function to load raster and handle NoData values
+def load_raster(file_path):
+    if not os.path.exists(file_path):
+        print(f"File not found: {file_path}")
+        return None, None
+    with rasterio.open(file_path) as src:
+        print(f"Loaded file: {file_path}")
+        data = src.read(1)
+        nodata = src.nodata  # Get NoData value from metadata
+        if nodata is not None:
+            data[data == nodata] = np.nan  # Mask NoData values
+        # Mask large placeholder values like -3.402823466e+38
+        data[data < -1e+38] = np.nan
+        return data, src.transform
+
+# Stack data from all sources
+def stack_data(common_years, ndvi_dir, lst_dir, precip_dir, pet_dir):
+    data = []
+    for year in common_years:
+        ndvi_path = os.path.join(ndvi_dir, f"NDVI_{year}.tif")
+        lst_path = os.path.join(lst_dir, f"LST_{year}.tif")
+        temp_path = os.path.join(lst_dir, f"MeanTemp_{year}.tif")
+        precip_path = os.path.join(precip_dir, f"Prec_{year}.tif")
+        pet_path = os.path.join(pet_dir, f"PET_{year}.tif")
+
+        if not all(os.path.exists(p) for p in [ndvi_path, lst_path, precip_path, pet_path]):
+            print(f"Skipping missing files for year: {year}")
+            continue
+
+        ndvi, _ = load_raster(ndvi_path)
+        lst, _ = load_raster(lst_path)
+        precip, _ = load_raster(precip_path)
+        pet, _ = load_raster(pet_path)
+        data.append((ndvi, lst, precip, pet))
+    return data
+
+data_stack = stack_data(common_years, ndvi_dir, lst_dir, precip_dir, pet_dir)
+print(f"Data stacked for {len(data_stack)} common years.")
+
+# Perform regression and calculate residuals
+def perform_regression(data_stack):
+    residuals = []
+    for i, (ndvi, lst, precip, pet) in enumerate(data_stack):
+        print(f"Processing regression for year index: {i}")
+
+        # Reduce decimals in debug output
+        print(f"Year index {i}: NDVI min={np.nanmin(ndvi):.3f}, max={np.nanmax(ndvi):.3f}")
+        print(f"Year index {i}: LST min={np.nanmin(lst):.3f}, max={np.nanmax(lst):.3f}")
+        print(f"Year index {i}: Precip min={np.nanmin(precip):.3f}, max={np.nanmax(precip):.3f}")
+        print(f"Year index {i}: PET min={np.nanmin(pet):.3f}, max={np.nanmax(pet):.3f}")
+
+        X = np.stack([precip.flatten(), pet.flatten(), lst.flatten()], axis=1)
+        y = ndvi.flatten()
+
+        # Mask invalid values
+        valid = ~np.isnan(X).any(axis=1) & ~np.isnan(y)
+        valid &= ~np.isinf(X).any(axis=1) & ~np.isinf(y)
+
+        if not np.any(valid):
+            print(f"No valid data points for year index: {i}. Skipping.")
+            residuals.append(None)
+            continue
+
+        X_valid = X[valid]
+        y_valid = y[valid]
+
+        # Perform regression
+        model = LinearRegression().fit(X_valid, y_valid)
+        predicted_ndvi = model.predict(X_valid)
+        residual = y_valid - predicted_ndvi
+
+        residual_map = np.full_like(ndvi.flatten(), np.nan)
+        residual_map[valid] = residual
+        residuals.append(residual_map.reshape(ndvi.shape))
+    return residuals
+
+residuals = perform_regression(data_stack)
+print(f"Calculated residuals for {len(residuals)} years.")
+
+# Save residuals as GeoTIFF
+def save_residuals(residuals, common_years, ndvi_dir, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    for i, residual in enumerate(residuals):
+        if residual is None:
+            print(f"Skipping empty residual for index: {i}")
+            continue
+        year = common_years[i]
+        output_path = os.path.join(output_dir, f"residual_{year}.tif")
+
+        ndvi_path = os.path.join(ndvi_dir, f"NDVI_{year}.tif")
+        with rasterio.open(ndvi_path) as src:
+            meta = src.meta
+            meta.update(dtype=rasterio.float32)
+            print(f"Writing residual to: {output_path}")
+            with rasterio.open(output_path, "w", **meta) as dst:
+                dst.write(residual.astype(rasterio.float32), 1)
+
+save_residuals(residuals, common_years, ndvi_dir, output_dir)
+
+# Perform residual trend analysis to generate trend map
+def residual_trend_analysis(residuals, common_years):
+    trend_map = np.full_like(residuals[0], np.nan)  # Initialize trend map with NaN values
+
+    for i in range(trend_map.shape[0]):  # Iterate over rows
+        for j in range(trend_map.shape[1]):  # Iterate over columns
+            # Collect residuals for the current pixel across all years
+            pixel_residuals = [residual[i, j] for residual in residuals if not np.isnan(residual[i, j])]
+            if len(pixel_residuals) < 2:  # If less than two valid points, skip trend calculation
+                continue
+
+            # Perform linear regression on the pixel residuals
+            years = np.arange(len(pixel_residuals))
+            model = LinearRegression().fit(years.reshape(-1, 1), np.array(pixel_residuals))
+            trend_map[i, j] = model.coef_[0]  # Store the trend (slope)
+
+    return trend_map
+
+# Calculate residual trend map
+trend_map = residual_trend_analysis(residuals, common_years)
+print("Residual trend map calculated.")
+
+# Save residual trend map
+def save_trend_map(trend_map, output_dir):
+    output_path = os.path.join(output_dir, "residual_trend_map.tif")
+    with rasterio.open(os.path.join(output_dir, f"residual_{common_years[0]}.tif")) as src:
+        meta = src.meta
+        meta.update(dtype=rasterio.float32)
+        print(f"Writing trend map to: {output_path}")
+        with rasterio.open(output_path, "w", **meta) as dst:
+            dst.write(trend_map.astype(rasterio.float32), 1)
+
+save_trend_map(trend_map, output_dir)
